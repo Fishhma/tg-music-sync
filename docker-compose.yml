@@ -1,0 +1,24 @@
+# Сервис можно вставить в существующий compose с Navidrome.
+# Главное: том с музыкой должен указывать на ту же папку хоста, что у Navidrome.
+services:
+  tg-music-sync:
+    build: .
+    container_name: tg-music-sync
+    restart: unless-stopped
+    env_file: .env
+    user: "${PUID:-1000}:${PGID:-1000}"   # не root: тот же владелец, что у файлов музыки
+
+    # --- ограничения безопасности ---
+    read_only: true                       # файловая система контейнера только для чтения
+    tmpfs:
+      - /tmp                              # временные файлы — в памяти
+    cap_drop:
+      - ALL                               # никаких особых привилегий Linux
+    security_opt:
+      - no-new-privileges:true            # процесс не может повысить свои права
+    mem_limit: 512m                       # потолок памяти
+    pids_limit: 100                       # потолок числа процессов
+
+    volumes:
+      - ${MUSIC_PATH}:/music              # единственная папка, куда пишутся треки
+      - ./data:/data                      # сессии Telegram + state.json
