@@ -2,3 +2,4 @@
 data/
 *.session
 *.part
+__pycache__/
