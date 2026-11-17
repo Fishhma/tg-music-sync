@@ -9,7 +9,8 @@ tg-music-sync: раз в месяц проверяет Telegram-каналы, п
 Запуск:
   python sync.py --login        # один раз, интерактивный вход в аккаунт-читалку
   python sync.py                # основной режим
-  python sync.py --fix-albums   # починить теги альбомов вида "[Канал](https://t.me/...)"
+  python sync.py --fix-tags     # показать, какие теги будут исправлены (tagfix.py)
+  python sync.py --fix-tags --apply   # исправить; откат: python tagfix.py --undo <бэкап>
 """
 import asyncio
 import datetime as dt
@@ -33,6 +34,8 @@ try:
 except ImportError:
     mutagen = None
 
+import tagfix
+
 # ---------- настройки ----------
 
 API_ID = int(os.environ.get("API_ID", "0") or 0)
@@ -46,6 +49,7 @@ SCAN_DAY = min(max(int(os.environ.get("SCAN_DAY", "1")), 1), 28)
 SCAN_HOUR = min(max(int(os.environ.get("SCAN_HOUR", "10")), 0), 23)
 TZ = ZoneInfo(os.environ.get("TZ", "UTC"))
 FIX_TAGS = os.environ.get("FIX_TAGS", "true").lower() == "true"
+AUTO_FIX_TAGS = os.environ.get("AUTO_FIX_TAGS", "true").lower() == "true"
 DOWNLOAD_DELAY = max(float(os.environ.get("DOWNLOAD_DELAY", "3")), 0)   # пауза между файлами, с
 MAX_FILES_PER_RUN = max(int(os.environ.get("MAX_FILES_PER_RUN", "200")), 1)
 
@@ -63,7 +67,6 @@ logging.getLogger("telethon").setLevel(logging.WARNING)
 
 MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
 URL = re.compile(r"(https?://|t\.me/|@)\S+")
-LINKISH = re.compile(r"\]\(|https?://|t\.me/")
 
 
 def clean_caption(text, chan):
@@ -205,10 +208,11 @@ def fix_tags(path, msg, album):
         if audio.tags is None:
             audio.add_tags()
         a = audio_attr(msg)
+        title = (a.title if a else None) or os.path.splitext(os.path.basename(path))[0]
         wanted = {
-            "title": (a.title if a else None) or os.path.splitext(os.path.basename(path))[0],
+            "title": title,
             "artist": a.performer if a else None,
-            "album": album,
+            "album": album or title,
         }
         changed = False
         for key, value in wanted.items():
@@ -231,32 +235,6 @@ def remove_part_files():
                 n += 1
     if n:
         log.info("Удалено недокачанных файлов: %d", n)
-
-
-def fix_albums():
-    """Чинит теги альбома, в которые старая версия записала подпись канала со ссылкой."""
-    if not mutagen:
-        log.error("mutagen не установлен")
-        return
-    fixed = 0
-    for root, _, files in os.walk(MUSIC_DIR):
-        for f in files:
-            if os.path.splitext(f)[1].lower() not in AUDIO_EXT:
-                continue
-            path = os.path.join(root, f)
-            try:
-                audio = mutagen.File(path, easy=True)
-                album = (audio.tags.get("album") or [""])[0] if audio and audio.tags else ""
-                if not LINKISH.search(album):
-                    continue
-                new = clean_caption(album, "") or os.path.basename(root)
-                audio.tags["album"] = new
-                audio.save()
-                fixed += 1
-                log.info("%s: «%s» → «%s»", f, album, new)
-            except Exception as e:
-                log.warning("%s: %s", path, e)
-    log.info("Исправлено файлов: %d", fixed)
 
 
 # ---------- сканирование ----------
@@ -430,7 +408,8 @@ async def download(user, key, prog):
     msgs = await flood_safe(lambda: user.get_messages(ent, ids=r["ids"]), prog)
     folder = os.path.join(MUSIC_DIR, clean(r["chan"]))
     os.makedirs(folder, exist_ok=True)
-    album = r["album"] or r["chan"]
+    # сингл: альбом = название трека; пачка без подписи: альбом = первый трек
+    album = r["album"] or (r["first"] if r["tracks"] > 1 else None)
     saved = 0
     for m in msgs:
         if cancel_event.is_set():
@@ -486,6 +465,15 @@ async def download_job(user, bot, keys, label):
             log.exception("download %s", k)
     save_state()  # сохранить измеренную скорость
 
+    tag_note = ""
+    if saved and AUTO_FIX_TAGS:
+        try:
+            n, _ = await asyncio.to_thread(tagfix.run, MUSIC_DIR, True, DATA_DIR)
+            tag_note = f"Теги приведены в порядок: {n} файлов" if n else ""
+        except Exception:
+            log.exception("tagfix")
+            tag_note = "⚠️ Не удалось исправить теги, см. логи"
+
     left = len([k for k in keys if k in state["pending"]])
     lines = [
         ("⏹ <b>Остановлено</b>" if stopped else "✅ <b>Готово</b>") + f": {esc(label)}",
@@ -495,6 +483,8 @@ async def download_job(user, bot, keys, label):
         lines.append(f"Ошибок: {failed} (релизы остались в списке)")
     if stopped:
         lines.append("Недокачанный файл удалён, уже скачанные на месте.")
+    if tag_note:
+        lines.append(tag_note)
     if left:
         lines.append(f"Осталось релизов: {left} — /pending")
     await prog.finish("\n".join(lines))
@@ -694,8 +684,8 @@ def setup_handlers(user, bot):
 async def main():
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    if "--fix-albums" in sys.argv:
-        fix_albums()
+    if "--fix-tags" in sys.argv or "--fix-albums" in sys.argv:
+        tagfix.main([MUSIC_DIR] + [a for a in sys.argv[1:] if a in ("--apply",)])
         return
 
     user = TelegramClient(os.path.join(DATA_DIR, "user"), API_ID, API_HASH)

@@ -129,6 +129,8 @@ def main():
 
     problems = []
     for key, rs in albums.items():
+        if all(norm(r["title"]) == key for r in rs):
+            continue  # синглы разных групп с одинаковым названием — это нормально
         eff_artists = collections.Counter(r["albumartist"] or r["artist"] for r in rs)
         years = collections.Counter(r["year"] for r in rs)
         spellings = collections.Counter(r["album"] for r in rs)
