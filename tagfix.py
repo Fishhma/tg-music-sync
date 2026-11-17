@@ -6,12 +6,15 @@ tagfix — приводит теги в порядок, чтобы Navidrome п�
   python3 tagfix.py --undo ФАЙЛ_БЭКАПА   # вернуть теги из резервной копии
 
 Правила:
+  0. Кракозябры из Windows-1251 ("Ãðóïïà") -> нормальный текст ("Группа").
   1. Чистка: лишние пробелы, хвосты вида "By_XXXX" у исполнителей, ссылки и
      префикс года ("2014 - Альбом") в названии альбома.
   2. Одинаковое написание исполнителей: варианты, отличающиеся регистром,
-     пробелами и знаками препинания, приводятся к самому частому.
-  3. Мусор вместо альбома (пусто, "single", "#хэштег", название канала, ссылка)
-     -> сингл: альбом = название трека.
+     пробелами, знаками препинания и умлаутами, приводятся к самому частому.
+     Псевдонимы (например, кириллица/латиница) — в tag_overrides.json -> "artists".
+  3. Мусор вместо альбома (пусто, "single", "#хэштег", "Неизвестный альбом",
+     название канала, ссылка) -> сингл: альбом = название трека.
+     Заглавный трек альбома синглом не считается.
   4. Исполнитель альбома (albumartist) для каждого альбома:
        одна группа (в т.ч. "X feat. Y")      -> X
        сборник (Vol., Teil, II…) или > 3 групп -> Various Artists + флаг compilation
@@ -25,6 +28,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 
 import mutagen
 
@@ -33,6 +37,7 @@ FIELDS = ["artist", "albumartist", "album", "title", "date", "compilation"]
 VA = "Various Artists"
 MAX_SPLIT_ARTISTS = 3
 
+JUNK_PREFIXES = ("неизвестный альбом", "unknown album", "без названия")
 JUNK_ALBUMS = {"single", "singles", "сингл", "синглы", "same", "unknown", "unknown album",
                "неизвестно", "без альбома", "untitled", "track", "new"}
 COMPILATION_RE = re.compile(
@@ -60,7 +65,23 @@ def space(s):
 
 
 def loose(s):
-    return re.sub(r"[\W_]+", "", (s or "").casefold())
+    """Ключ сравнения: без регистра, пробелов, знаков препинания и диакритики."""
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"[\W_]+", "", s.casefold())
+
+
+def demojibake(s):
+    """'Ãðóïïà' (cp1251, прочитанный как latin-1) -> 'Группа'."""
+    if not s or not re.search(r"[\xc0-\xff]{2}", s):
+        return s
+    try:
+        t = s.encode("latin-1").decode("cp1251")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return s
+    letters = sum(1 for c in t if c.isalpha())
+    cyr = sum(1 for c in t if "Ѐ" <= c <= "ӿ")  # кириллица
+    return t if letters and cyr / letters > 0.6 else s
 
 
 def primary(artist):
@@ -108,21 +129,28 @@ def load_overrides(data_dir):
     p = os.path.join(data_dir, "tag_overrides.json")
     try:
         with open(p, encoding="utf-8") as f:
-            raw = json.load(f).get("albums", {})
-        return {space(k).casefold(): v for k, v in raw.items()}
+            raw = json.load(f)
     except FileNotFoundError:
-        return {}
+        return {"albums": {}, "artists": {}}
+    return {
+        "albums": {space(k).casefold(): v for k, v in raw.get("albums", {}).items()},
+        "artists": {loose(k): v for k, v in raw.get("artists", {}).items()},
+    }
 
 
 # ---------- правила ----------
 
 def plan(recs, overrides=None):
     overrides = overrides or {}
+    album_ov = overrides.get("albums", {})
+    aliases = overrides.get("artists", {})
     channels = {r["channel"].casefold() for r in recs if r["channel"]}
 
-    # 1. чистка
+    # 0–1. кодировка и чистка
     for r in recs:
         n = r["new"]
+        for f in ("artist", "albumartist", "album", "title"):
+            n[f] = demojibake(n[f])
         for f in ("artist", "albumartist"):
             n[f] = BY_RE.sub("", space(n[f]))
         a = URL.sub("", MD_LINK.sub(r"\1", n["album"]))
@@ -131,36 +159,62 @@ def plan(recs, overrides=None):
         n["album"] = a2 or a
         n["title"] = space(n["title"])
 
-    # 2. одно написание исполнителя
+    # 2. одно написание исполнителя (+ псевдонимы из overrides)
+    for r in recs:
+        for f in ("artist", "albumartist"):
+            v = r["new"][f]
+            if v and loose(v) in aliases:
+                r["new"][f] = aliases[loose(v)]
+            elif v and loose(primary(v)) in aliases and primary(v) != v:
+                r["new"][f] = aliases[loose(primary(v))] + v[len(primary(v)):]
     spell = collections.defaultdict(collections.Counter)
     for r in recs:
         for f in ("artist", "albumartist"):
-            if r["new"][f]:
-                spell[loose(r["new"][f])][r["new"][f]] += 1
+            v = r["new"][f]
+            if v:
+                spell[loose(v)][v] += 1
+                if primary(v) != v:
+                    spell[loose(primary(v))][primary(v)] += 0  # чтобы «X feat. Y» знал о X
     canon = {k: c.most_common(1)[0][0] for k, c in spell.items()}
+
+    def name(v):
+        return canon.get(loose(v), v) if v else v
+
+    def prim(v):
+        return name(primary(v))
+
     for r in recs:
         for f in ("artist", "albumartist"):
-            if r["new"][f]:
-                r["new"][f] = canon[loose(r["new"][f])]
+            r["new"][f] = name(r["new"][f])
 
     # 3. мусор вместо альбома -> сингл
     for r in recs:
         n = r["new"]
         al = n["album"].casefold()
-        if (not al or al in JUNK_ALBUMS or al.startswith("#") or al in channels
-                or URL.search(r["orig"]["album"]) or "](" in r["orig"]["album"]):
+        if (not al or al in JUNK_ALBUMS or al.startswith("#") or al.startswith(JUNK_PREFIXES)
+                or al in channels or URL.search(r["orig"]["album"]) or "](" in r["orig"]["album"]):
             n["album"] = n["title"] or r["stem"]
-            n["albumartist"] = n["albumartist"] or primary(n["artist"])
+            n["albumartist"] = n["albumartist"] or prim(n["artist"])
             n["compilation"] = ""
             r["single"] = True
-        elif n["title"] and al == n["title"].casefold():
-            r["single"] = True  # уже оформленный сингл: альбом = название трека
+
+    # уже оформленные синглы: у «альбома» все треки называются как альбом.
+    # Заглавный трек настоящего альбома сюда не попадает.
+    by_album = collections.defaultdict(list)
+    for r in recs:
+        if not r["single"]:
+            by_album[r["new"]["album"].casefold()].append(r)
+    for album_cf, rs in by_album.items():
+        if all(r["new"]["title"].casefold() == album_cf for r in rs):
+            for r in rs:
+                r["single"] = True
+                r["new"]["albumartist"] = r["new"]["albumartist"] or prim(r["new"]["artist"])
 
     # 4–5. альбомы
     groups = collections.defaultdict(list)
     for r in recs:
         n = r["new"]
-        key = (n["album"].casefold(), loose(primary(n["albumartist"] or n["artist"]))) if r["single"] \
+        key = (n["album"].casefold(), loose(prim(n["albumartist"] or n["artist"]))) if r["single"] \
             else (n["album"].casefold(), "")
         groups[key].append(r)
 
@@ -170,7 +224,7 @@ def plan(recs, overrides=None):
             r["new"]["album"] = album
 
         if not rs[0]["single"]:
-            ov = overrides.get(album_cf)
+            ov = album_ov.get(album_cf)
             aas = {r["new"]["albumartist"] for r in rs}
             if ov:
                 aa = VA if ov.get("compilation") else ov.get("albumartist", "")
@@ -180,9 +234,13 @@ def plan(recs, overrides=None):
             else:
                 order = collections.Counter()
                 for r in rs:
-                    order[primary(r["new"]["albumartist"] or r["new"]["artist"])] += 1
+                    who = prim(r["new"]["albumartist"] or r["new"]["artist"])
+                    if who:  # трек без исполнителя не считается отдельной группой
+                        order[who] += 1
                 prims = [p for p, _ in order.most_common()]
-                if len(prims) == 1:
+                if not prims:
+                    aa, comp = "", ""
+                elif len(prims) == 1:
                     aa, comp = prims[0], ""
                 elif COMPILATION_RE.search(album) or len(prims) > MAX_SPLIT_ARTISTS:
                     aa, comp = VA, "1"
@@ -192,6 +250,8 @@ def plan(recs, overrides=None):
                 for r in rs:
                     r["new"]["albumartist"] = aa
                     r["new"]["compilation"] = comp
+                    if not r["new"]["artist"] and comp != "1":
+                        r["new"]["artist"] = aa  # трек без исполнителя внутри альбома одной группы
 
         dates = [r["new"]["date"] for r in rs]
         if len(set(dates)) > 1:
